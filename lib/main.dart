@@ -1,15 +1,23 @@
 import 'dart:convert';
+import 'dart:math';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 // ============================================================
-//  GreenCart - simple cart app (FakeStore API)
-//  Dependency: flutter pub add http
+//  GreenCart v2 - cart app (FakeStore API)
+//  + Login / Register / Logout (lokal), Profile, Wishlist
+//
+//  Dependencies (pubspec.yaml -> dependencies):
+//    http, shared_preferences, crypto
 // ============================================================
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await auth.init(); // load akun & sesi tersimpan
   runApp(const MyApp());
 }
 
@@ -61,6 +69,7 @@ class CartItem {
 
 class Order {
   final String id;
+  final String userEmail;
   final DateTime date;
   final List<CartItem> items;
   final double total;
@@ -68,6 +77,7 @@ class Order {
 
   Order({
     required this.id,
+    required this.userEmail,
     required this.date,
     required this.items,
     required this.total,
@@ -75,8 +85,70 @@ class Order {
   });
 }
 
+class AppUser {
+  final String name;
+  final String email;
+  final String phone;
+  final String address; // opsional (boleh kosong)
+  final String? gender; // opsional
+  final int? age; // opsional
+  final String salt;
+  final String passHash;
+
+  AppUser({
+    required this.name,
+    required this.email,
+    required this.phone,
+    required this.address,
+    required this.gender,
+    required this.age,
+    required this.salt,
+    required this.passHash,
+  });
+
+  AppUser withProfile({
+    required String name,
+    required String phone,
+    required String address,
+    String? gender,
+    int? age,
+  }) =>
+      AppUser(
+        name: name,
+        email: email,
+        phone: phone,
+        address: address,
+        gender: gender,
+        age: age,
+        salt: salt,
+        passHash: passHash,
+      );
+
+  Map<String, dynamic> toJson() => {
+        'name': name,
+        'email': email,
+        'phone': phone,
+        'address': address,
+        'gender': gender,
+        'age': age,
+        'salt': salt,
+        'passHash': passHash,
+      };
+
+  factory AppUser.fromJson(Map<String, dynamic> j) => AppUser(
+        name: j['name'] as String,
+        email: j['email'] as String,
+        phone: j['phone'] as String,
+        address: (j['address'] as String?) ?? '',
+        gender: j['gender'] as String?,
+        age: (j['age'] as num?)?.toInt(),
+        salt: j['salt'] as String,
+        passHash: j['passHash'] as String,
+      );
+}
+
 // ------------------------------------------------------------
-// STATE (simple ChangeNotifier, tanpa package tambahan)
+// STATE (ChangeNotifier sederhana)
 // ------------------------------------------------------------
 class CartController extends ChangeNotifier {
   final Map<int, CartItem> _items = {};
@@ -119,7 +191,9 @@ class CartController extends ChangeNotifier {
 
 class OrderController extends ChangeNotifier {
   final List<Order> _orders = [];
-  List<Order> get orders => List.unmodifiable(_orders.reversed);
+
+  List<Order> ordersFor(String? email) =>
+      _orders.where((o) => o.userEmail == email).toList().reversed.toList();
 
   void add(Order o) {
     _orders.add(o);
@@ -127,8 +201,167 @@ class OrderController extends ChangeNotifier {
   }
 }
 
+/// Wishlist per-user, disimpan di shared_preferences.
+class WishlistController extends ChangeNotifier {
+  final Set<int> _ids = {};
+  String? _email;
+
+  int get count => _ids.length;
+  bool has(int id) => _ids.contains(id);
+
+  String get _key => 'wishlist_$_email';
+
+  Future<void> load(String email) async {
+    _email = email;
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList('wishlist_$email') ?? [];
+    _ids
+      ..clear()
+      ..addAll(list.map(int.parse));
+    notifyListeners();
+  }
+
+  void unload() {
+    _email = null;
+    _ids.clear();
+    notifyListeners();
+  }
+
+  Future<void> toggle(int id) async {
+    if (_email == null) return;
+    if (!_ids.remove(id)) _ids.add(id);
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(_key, _ids.map((e) => e.toString()).toList());
+  }
+}
+
+/// Auth lokal (frontend only). Akun disimpan di shared_preferences.
+/// Password di-hash (SHA-256 + salt), tapi ini tetap hanya untuk demo:
+/// aplikasi sungguhan harus autentikasi lewat backend.
+class AuthController extends ChangeNotifier {
+  final Map<String, AppUser> _users = {};
+  AppUser? _current;
+
+  AppUser? get user => _current;
+  bool get isLoggedIn => _current != null;
+
+  Future<void> init() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('users');
+    if (raw != null) {
+      try {
+        for (final e in jsonDecode(raw) as List<dynamic>) {
+          final u = AppUser.fromJson(e as Map<String, dynamic>);
+          _users[u.email] = u;
+        }
+      } catch (_) {
+        _users.clear();
+      }
+    }
+    final session = prefs.getString('session');
+    if (session != null && _users.containsKey(session)) {
+      _current = _users[session];
+      await wishlist.load(session);
+    }
+  }
+
+  String _hash(String password, String salt) =>
+      sha256.convert(utf8.encode('$salt:$password')).toString();
+
+  Future<void> _saveUsers() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+        'users', jsonEncode(_users.values.map((u) => u.toJson()).toList()));
+  }
+
+  Future<void> _startSession(AppUser u) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('session', u.email);
+    await wishlist.load(u.email);
+    _current = u;
+    notifyListeners();
+  }
+
+  /// return null kalau sukses, atau pesan error.
+  Future<String?> register({
+    required String name,
+    required String email,
+    required String password,
+    required String phone,
+    String address = '',
+    String? gender,
+    int? age,
+  }) async {
+    final e = email.trim().toLowerCase();
+    if (_users.containsKey(e)) return 'Email sudah terdaftar. Silakan login.';
+    final salt =
+        '${DateTime.now().microsecondsSinceEpoch}${Random.secure().nextInt(1 << 31)}';
+    final u = AppUser(
+      name: name.trim(),
+      email: e,
+      phone: phone.trim(),
+      address: address.trim(),
+      gender: gender,
+      age: age,
+      salt: salt,
+      passHash: _hash(password, salt),
+    );
+    _users[e] = u;
+    await _saveUsers();
+    await _startSession(u);
+    return null;
+  }
+
+  Future<String?> login(String email, String password) async {
+    final e = email.trim().toLowerCase();
+    final u = _users[e];
+    if (u == null || u.passHash != _hash(password, u.salt)) {
+      return 'Email atau password salah.';
+    }
+    await _startSession(u);
+    return null;
+  }
+
+  Future<void> updateProfile(AppUser updated) async {
+    _users[updated.email] = updated;
+    _current = updated;
+    await _saveUsers();
+    notifyListeners();
+  }
+
+  Future<void> logout() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('session');
+    cart.clear();
+    wishlist.unload();
+    navIndex.value = 0;
+    _current = null;
+    notifyListeners();
+  }
+}
+
+/// Cache daftar produk supaya tidak fetch ulang tiap pindah halaman.
+class ProductStore {
+  Future<List<Product>>? _future;
+
+  Future<List<Product>> load({bool force = false}) {
+    if (force || _future == null) {
+      final f = fetchProducts();
+      _future = f;
+      f.then((_) {}, onError: (_) {
+        if (identical(_future, f)) _future = null; // boleh dicoba lagi
+      });
+    }
+    return _future!;
+  }
+}
+
 final cart = CartController();
 final orderStore = OrderController();
+final wishlist = WishlistController();
+final auth = AuthController();
+final productStore = ProductStore();
 final ValueNotifier<int> navIndex = ValueNotifier<int>(0);
 
 // ------------------------------------------------------------
@@ -159,6 +392,34 @@ String titleCase(String s) => s
     .split(' ')
     .map((w) => w.isEmpty ? w : w[0].toUpperCase() + w.substring(1))
     .join(' ');
+
+final _emailRegex = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
+Future<void> confirmLogout(BuildContext context) async {
+  final ok = await showDialog<bool>(
+    context: context,
+    builder: (ctx) => AlertDialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      title: const Text('Logout?'),
+      content: const Text('Kamu yakin mau keluar dari akun ini?'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(ctx, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          style: FilledButton.styleFrom(
+            minimumSize: const Size(96, 42),
+            backgroundColor: Colors.redAccent,
+          ),
+          onPressed: () => Navigator.pop(ctx, true),
+          child: const Text('Logout'),
+        ),
+      ],
+    ),
+  );
+  if (ok == true) await auth.logout();
+}
 
 // ------------------------------------------------------------
 // APP
@@ -214,8 +475,399 @@ class MyApp extends StatelessWidget {
             ),
           ),
         ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size.fromHeight(50),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(14),
+            ),
+          ),
+        ),
       ),
-      home: const HomeShell(),
+      // Belum login -> AuthPage, sudah login -> HomeShell
+      home: ListenableBuilder(
+        listenable: auth,
+        builder: (context, _) =>
+            auth.isLoggedIn ? const HomeShell() : const AuthPage(),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// AVATAR (inisial nama, tanpa foto)
+// ------------------------------------------------------------
+class UserAvatar extends StatelessWidget {
+  final String name;
+  final double radius;
+  const UserAvatar({super.key, required this.name, this.radius = 24});
+
+  static const _colors = [
+    Color(0xFF2E9E5B),
+    Color(0xFF1F7A8C),
+    Color(0xFF6A994E),
+    Color(0xFF3A7D44),
+    Color(0xFF52796F),
+    Color(0xFF8A9A5B),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final parts =
+        name.trim().split(RegExp(r'\s+')).where((p) => p.isNotEmpty).toList();
+    final initials = parts.isEmpty
+        ? '?'
+        : parts.take(2).map((p) => p[0].toUpperCase()).join();
+    final color =
+        _colors[name.codeUnits.fold<int>(0, (a, b) => a + b) % _colors.length];
+    return CircleAvatar(
+      radius: radius,
+      backgroundColor: color,
+      child: Text(
+        initials,
+        style: TextStyle(
+          color: Colors.white,
+          fontWeight: FontWeight.w800,
+          fontSize: radius * 0.8,
+        ),
+      ),
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// AUTH PAGE (Login + Register)
+// ------------------------------------------------------------
+class GenderPicker extends StatelessWidget {
+  final String? value;
+  final ValueChanged<String?> onChanged;
+  const GenderPicker({super.key, required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      children: [
+        for (final g in const ['Male', 'Female', 'Other'])
+          ChoiceChip(
+            label: Text(g),
+            selected: value == g,
+            // tap lagi untuk membatalkan pilihan (opsional)
+            onSelected: (sel) => onChanged(sel ? g : null),
+          ),
+      ],
+    );
+  }
+}
+
+class AuthPage extends StatefulWidget {
+  const AuthPage({super.key});
+
+  @override
+  State<AuthPage> createState() => _AuthPageState();
+}
+
+class _AuthPageState extends State<AuthPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _name = TextEditingController();
+  final _email = TextEditingController();
+  final _phone = TextEditingController();
+  final _password = TextEditingController();
+  final _address = TextEditingController();
+  final _age = TextEditingController();
+
+  bool _isLogin = true;
+  bool _obscure = true;
+  bool _loading = false;
+  String? _error;
+  String? _gender;
+
+  @override
+  void dispose() {
+    for (final c in [_name, _email, _phone, _password, _address, _age]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    FocusScope.of(context).unfocus();
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    await Future.delayed(const Duration(milliseconds: 500));
+
+    final String? err = _isLogin
+        ? await auth.login(_email.text, _password.text)
+        : await auth.register(
+            name: _name.text,
+            email: _email.text,
+            password: _password.text,
+            phone: _phone.text,
+            address: _address.text,
+            gender: _gender,
+            age: int.tryParse(_age.text),
+          );
+
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _error = err;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final topPad = MediaQuery.of(context).padding.top;
+
+    return Scaffold(
+      body: SingleChildScrollView(
+        child: Column(
+          children: [
+            // Header hijau
+            Container(
+              width: double.infinity,
+              padding: EdgeInsets.fromLTRB(24, topPad + 36, 24, 36),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [scheme.primary, Colors.green.shade800],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius:
+                    const BorderRadius.vertical(bottom: Radius.circular(32)),
+              ),
+              child: Column(
+                children: [
+                  const CircleAvatar(
+                    radius: 34,
+                    backgroundColor: Colors.white,
+                    child: Icon(Icons.eco, color: Color(0xFF2E9E5B), size: 40),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text('GreenCart',
+                      style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 4),
+                  Text(
+                    _isLogin ? 'Welcome back!' : 'Create your account',
+                    style: const TextStyle(color: Colors.white70),
+                  ),
+                ],
+              ),
+            ),
+
+            // Form
+            Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 480),
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(_isLogin ? 'Login' : 'Register',
+                            style: const TextStyle(
+                                fontSize: 22, fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 16),
+
+                        if (!_isLogin) ...[
+                          TextFormField(
+                            controller: _name,
+                            textCapitalization: TextCapitalization.words,
+                            textInputAction: TextInputAction.next,
+                            decoration: const InputDecoration(
+                                labelText: 'Full name *',
+                                prefixIcon: Icon(Icons.person_outline)),
+                            validator: (v) =>
+                                (v == null || v.trim().length < 3)
+                                    ? 'Isi nama lengkap (min. 3 karakter)'
+                                    : null,
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+
+                        TextFormField(
+                          controller: _email,
+                          keyboardType: TextInputType.emailAddress,
+                          textInputAction: TextInputAction.next,
+                          autocorrect: false,
+                          decoration: const InputDecoration(
+                              labelText: 'Email *',
+                              prefixIcon: Icon(Icons.mail_outline)),
+                          validator: (v) =>
+                              (v == null || !_emailRegex.hasMatch(v.trim()))
+                                  ? 'Email tidak valid'
+                                  : null,
+                        ),
+                        const SizedBox(height: 12),
+
+                        if (!_isLogin) ...[
+                          TextFormField(
+                            controller: _phone,
+                            keyboardType: TextInputType.phone,
+                            textInputAction: TextInputAction.next,
+                            inputFormatters: [
+                              FilteringTextInputFormatter.digitsOnly,
+                              LengthLimitingTextInputFormatter(15),
+                            ],
+                            decoration: const InputDecoration(
+                                labelText: 'Phone number *',
+                                prefixIcon: Icon(Icons.phone_outlined)),
+                            validator: (v) => (v == null || v.length < 8)
+                                ? 'Nomor telepon tidak valid'
+                                : null,
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+
+                        TextFormField(
+                          controller: _password,
+                          obscureText: _obscure,
+                          textInputAction: _isLogin
+                              ? TextInputAction.done
+                              : TextInputAction.next,
+                          onFieldSubmitted: (_) {
+                            if (_isLogin) _submit();
+                          },
+                          decoration: InputDecoration(
+                            labelText: 'Password *',
+                            prefixIcon: const Icon(Icons.lock_outline),
+                            suffixIcon: IconButton(
+                              icon: Icon(_obscure
+                                  ? Icons.visibility_outlined
+                                  : Icons.visibility_off_outlined),
+                              onPressed: () =>
+                                  setState(() => _obscure = !_obscure),
+                            ),
+                          ),
+                          validator: (v) {
+                            if (v == null || v.isEmpty) {
+                              return 'Isi password';
+                            }
+                            if (!_isLogin && v.length < 6) {
+                              return 'Minimal 6 karakter';
+                            }
+                            return null;
+                          },
+                        ),
+
+                        if (!_isLogin) ...[
+                          const SizedBox(height: 20),
+                          const Text('Optional',
+                              style: TextStyle(
+                                  fontWeight: FontWeight.w700,
+                                  color: Colors.black54)),
+                          const SizedBox(height: 10),
+                          TextFormField(
+                            controller: _address,
+                            maxLines: 2,
+                            textInputAction: TextInputAction.next,
+                            decoration: const InputDecoration(
+                                labelText: 'Address',
+                                alignLabelWithHint: true,
+                                prefixIcon: Icon(Icons.location_on_outlined)),
+                          ),
+                          const SizedBox(height: 12),
+                          TextFormField(
+                            controller: _age,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [
+                              FilteringTextInputFormatter.digitsOnly,
+                              LengthLimitingTextInputFormatter(3),
+                            ],
+                            decoration: const InputDecoration(
+                                labelText: 'Age',
+                                prefixIcon: Icon(Icons.cake_outlined)),
+                            validator: (v) {
+                              if (v == null || v.isEmpty) return null;
+                              final n = int.tryParse(v);
+                              return (n == null || n < 1 || n > 120)
+                                  ? 'Umur tidak valid'
+                                  : null;
+                            },
+                          ),
+                          const SizedBox(height: 14),
+                          const Text('Gender',
+                              style: TextStyle(color: Colors.black54)),
+                          const SizedBox(height: 6),
+                          GenderPicker(
+                            value: _gender,
+                            onChanged: (g) => setState(() => _gender = g),
+                          ),
+                        ],
+
+                        if (_error != null) ...[
+                          const SizedBox(height: 16),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.red.shade50,
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.red.shade200),
+                            ),
+                            child: Row(
+                              children: [
+                                Icon(Icons.error_outline,
+                                    color: Colors.red.shade700, size: 20),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: Text(_error!,
+                                      style: TextStyle(
+                                          color: Colors.red.shade800,
+                                          fontSize: 13)),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+
+                        const SizedBox(height: 22),
+                        FilledButton(
+                          onPressed: _loading ? null : _submit,
+                          child: _loading
+                              ? const SizedBox(
+                                  width: 22,
+                                  height: 22,
+                                  child: CircularProgressIndicator(
+                                      strokeWidth: 2.5, color: Colors.white),
+                                )
+                              : Text(_isLogin ? 'Login' : 'Create Account',
+                                  style: const TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700)),
+                        ),
+                        const SizedBox(height: 8),
+                        Center(
+                          child: TextButton(
+                            onPressed: _loading
+                                ? null
+                                : () => setState(() {
+                                      _isLogin = !_isLogin;
+                                      _error = null;
+                                    }),
+                            child: Text(_isLogin
+                                ? 'Belum punya akun? Register'
+                                : 'Sudah punya akun? Login'),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -226,7 +878,13 @@ class MyApp extends StatelessWidget {
 class HomeShell extends StatelessWidget {
   const HomeShell({super.key});
 
-  static const _titles = ['Products', 'My Cart', 'Order History'];
+  static const _titles = [
+    'Products',
+    'My Cart',
+    'Wishlist',
+    'Order History',
+    'My Profile',
+  ];
 
   @override
   Widget build(BuildContext context) {
@@ -260,7 +918,9 @@ class HomeShell extends StatelessWidget {
             children: const [
               ProductsPage(),
               CartPage(),
+              WishlistPage(),
               OrdersPage(),
+              ProfilePage(),
             ],
           ),
         );
@@ -276,6 +936,15 @@ class _AppDrawer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+
+    Widget countBadge(int n) => n > 0
+        ? CircleAvatar(
+            radius: 11,
+            backgroundColor: scheme.primary,
+            child: Text('$n',
+                style: const TextStyle(fontSize: 11, color: Colors.white)),
+          )
+        : const SizedBox.shrink();
 
     Widget item(IconData icon, String label, int idx, {Widget? trailing}) {
       return ListTile(
@@ -296,67 +965,96 @@ class _AppDrawer extends StatelessWidget {
       child: SafeArea(
         child: Column(
           children: [
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.fromLTRB(20, 28, 20, 24),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  colors: [scheme.primary, Colors.green.shade800],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-              ),
-              child: const Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  CircleAvatar(
-                    radius: 28,
-                    backgroundColor: Colors.white,
-                    child: Icon(Icons.eco, color: Color(0xFF2E9E5B), size: 32),
+            // Header: avatar + nama + email
+            InkWell(
+              onTap: () {
+                navIndex.value = 4;
+                Navigator.pop(context);
+              },
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.fromLTRB(20, 28, 20, 22),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [scheme.primary, Colors.green.shade800],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
                   ),
-                  SizedBox(height: 14),
-                  Text('GreenCart',
-                      style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 22,
-                          fontWeight: FontWeight.w800)),
-                  SizedBox(height: 2),
-                  Text('Simple shopping, powered by FakeStore API',
-                      style: TextStyle(color: Colors.white70, fontSize: 12)),
-                ],
+                ),
+                child: ListenableBuilder(
+                  listenable: auth,
+                  builder: (context, _) {
+                    final u = auth.user;
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(3),
+                          decoration: const BoxDecoration(
+                              color: Colors.white, shape: BoxShape.circle),
+                          child: UserAvatar(name: u?.name ?? '?', radius: 28),
+                        ),
+                        const SizedBox(height: 14),
+                        Text(u?.name ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white,
+                                fontSize: 19,
+                                fontWeight: FontWeight.w800)),
+                        const SizedBox(height: 2),
+                        Text(u?.email ?? '',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                                color: Colors.white70, fontSize: 12)),
+                      ],
+                    );
+                  },
+                ),
               ),
             ),
             const SizedBox(height: 8),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 10),
-              child: Column(
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
                 children: [
                   item(Icons.storefront_outlined, 'Products', 0),
                   ListenableBuilder(
                     listenable: cart,
                     builder: (context, _) => item(
-                      Icons.shopping_cart_outlined,
-                      'My Cart',
-                      1,
-                      trailing: cart.count > 0
-                          ? CircleAvatar(
-                              radius: 11,
-                              backgroundColor: scheme.primary,
-                              child: Text('${cart.count}',
-                                  style: const TextStyle(
-                                      fontSize: 11, color: Colors.white)),
-                            )
-                          : null,
-                    ),
+                        Icons.shopping_cart_outlined, 'My Cart', 1,
+                        trailing: countBadge(cart.count)),
                   ),
-                  item(Icons.receipt_long_outlined, 'Order History', 2),
+                  ListenableBuilder(
+                    listenable: wishlist,
+                    builder: (context, _) => item(
+                        Icons.favorite_border, 'Wishlist', 2,
+                        trailing: countBadge(wishlist.count)),
+                  ),
+                  item(Icons.receipt_long_outlined, 'Order History', 3),
+                  item(Icons.person_outline, 'My Profile', 4),
                 ],
               ),
             ),
-            const Spacer(),
+            const Divider(height: 1),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(10, 8, 10, 0),
+              child: ListTile(
+                leading: const Icon(Icons.logout, color: Colors.redAccent),
+                title: const Text('Logout',
+                    style: TextStyle(color: Colors.redAccent)),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12)),
+                onTap: () {
+                  Navigator.pop(context); // tutup drawer
+                  confirmLogout(context);
+                },
+              ),
+            ),
             const Padding(
-              padding: EdgeInsets.all(16),
-              child: Text('v1.0.0 • Demo only, payment is simulated',
+              padding: EdgeInsets.all(12),
+              child: Text('v2.0.0 • Demo only, payment is simulated',
                   style: TextStyle(color: Colors.black45, fontSize: 11)),
             ),
           ],
@@ -384,10 +1082,10 @@ class _ProductsPageState extends State<ProductsPage> {
   @override
   void initState() {
     super.initState();
-    _future = fetchProducts();
+    _future = productStore.load();
   }
 
-  void _reload() => setState(() => _future = fetchProducts());
+  void _reload() => setState(() => _future = productStore.load(force: true));
 
   @override
   Widget build(BuildContext context) {
@@ -439,7 +1137,9 @@ class _ProductsPageState extends State<ProductsPage> {
         return RefreshIndicator(
           onRefresh: () async {
             _reload();
-            await _future;
+            try {
+              await _future;
+            } catch (_) {}
           },
           child: CustomScrollView(
             physics: const AlwaysScrollableScrollPhysics(),
@@ -484,26 +1184,70 @@ class _ProductsPageState extends State<ProductsPage> {
               else
                 SliverPadding(
                   padding: const EdgeInsets.all(16),
-                  sliver: SliverLayoutBuilder(
-                    builder: (context, constraints) {
-                      final w = constraints.crossAxisExtent;
-                      final cols = (w / 190).floor().clamp(2, 5);
-                      return SliverGrid(
-                        gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
-                          crossAxisCount: cols,
-                          mainAxisSpacing: 12,
-                          crossAxisSpacing: 12,
-                          mainAxisExtent: 290,
-                        ),
-                        delegate: SliverChildBuilderDelegate(
-                          (context, i) => ProductCard(product: products[i]),
-                          childCount: products.length,
-                        ),
-                      );
-                    },
-                  ),
+                  sliver: ProductGridSliver(products: products),
                 ),
             ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class ProductGridSliver extends StatelessWidget {
+  final List<Product> products;
+  const ProductGridSliver({super.key, required this.products});
+
+  @override
+  Widget build(BuildContext context) {
+    return SliverLayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.crossAxisExtent;
+        final cols = (w / 190).floor().clamp(2, 5);
+        return SliverGrid(
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: cols,
+            mainAxisSpacing: 12,
+            crossAxisSpacing: 12,
+            mainAxisExtent: 290,
+          ),
+          delegate: SliverChildBuilderDelegate(
+            (context, i) => ProductCard(product: products[i]),
+            childCount: products.length,
+          ),
+        );
+      },
+    );
+  }
+}
+
+class HeartButton extends StatelessWidget {
+  final Product product;
+  const HeartButton({super.key, required this.product});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: wishlist,
+      builder: (context, _) {
+        final fav = wishlist.has(product.id);
+        return Material(
+          color: Colors.white,
+          shape: CircleBorder(side: BorderSide(color: Colors.green.shade100)),
+          child: InkWell(
+            customBorder: const CircleBorder(),
+            onTap: () {
+              HapticFeedback.selectionClick();
+              wishlist.toggle(product.id);
+            },
+            child: Padding(
+              padding: const EdgeInsets.all(6),
+              child: Icon(
+                fav ? Icons.favorite : Icons.favorite_border,
+                size: 20,
+                color: fav ? Colors.redAccent : Colors.black45,
+              ),
+            ),
           ),
         );
       },
@@ -528,23 +1272,35 @@ class ProductCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
-                child: Center(
-                  child: Image.network(
-                    product.image,
-                    fit: BoxFit.contain,
-                    loadingBuilder: (c, child, p) => p == null
-                        ? child
-                        : const Center(
-                            child: SizedBox(
-                                width: 22,
-                                height: 22,
-                                child:
-                                    CircularProgressIndicator(strokeWidth: 2))),
-                    errorBuilder: (_, __, ___) => const Icon(
-                        Icons.image_not_supported_outlined,
-                        color: Colors.black26,
-                        size: 40),
-                  ),
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Image.network(
+                          product.image,
+                          fit: BoxFit.contain,
+                          loadingBuilder: (c, child, p) => p == null
+                              ? child
+                              : const Center(
+                                  child: SizedBox(
+                                      width: 22,
+                                      height: 22,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2))),
+                          errorBuilder: (_, __, ___) => const Icon(
+                              Icons.image_not_supported_outlined,
+                              color: Colors.black26,
+                              size: 40),
+                        ),
+                      ),
+                    ),
+                    Positioned(
+                      top: 0,
+                      right: 0,
+                      child: HeartButton(product: product),
+                    ),
+                  ],
                 ),
               ),
               const SizedBox(height: 8),
@@ -645,9 +1401,15 @@ void showProductDetail(BuildContext context, Product p) {
                     child: Image.network(p.image, fit: BoxFit.contain),
                   ),
                   const SizedBox(height: 16),
-                  Chip(
-                    label: Text(titleCase(p.category)),
-                    visualDensity: VisualDensity.compact,
+                  Row(
+                    children: [
+                      Chip(
+                        label: Text(titleCase(p.category)),
+                        visualDensity: VisualDensity.compact,
+                      ),
+                      const Spacer(),
+                      HeartButton(product: p),
+                    ],
                   ),
                   const SizedBox(height: 8),
                   Text(p.title,
@@ -699,6 +1461,483 @@ void showProductDetail(BuildContext context, Product p) {
       );
     },
   );
+}
+
+// ------------------------------------------------------------
+// WISHLIST PAGE
+// ------------------------------------------------------------
+class WishlistPage extends StatefulWidget {
+  const WishlistPage({super.key});
+
+  @override
+  State<WishlistPage> createState() => _WishlistPageState();
+}
+
+class _WishlistPageState extends State<WishlistPage> {
+  late Future<List<Product>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = productStore.load();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<List<Product>>(
+      future: _future,
+      builder: (context, snap) {
+        if (snap.connectionState != ConnectionState.done) {
+          return const Center(child: CircularProgressIndicator());
+        }
+        if (snap.hasError) {
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.wifi_off, size: 56, color: Colors.black38),
+                const SizedBox(height: 12),
+                const Text('Gagal memuat produk'),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  style:
+                      FilledButton.styleFrom(minimumSize: const Size(160, 46)),
+                  onPressed: () => setState(
+                      () => _future = productStore.load(force: true)),
+                  icon: const Icon(Icons.refresh),
+                  label: const Text('Coba lagi'),
+                ),
+              ],
+            ),
+          );
+        }
+
+        return ListenableBuilder(
+          listenable: wishlist,
+          builder: (context, _) {
+            final items =
+                snap.data!.where((p) => wishlist.has(p.id)).toList();
+
+            if (items.isEmpty) {
+              return Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(Icons.favorite_border,
+                        size: 80, color: Colors.green.shade200),
+                    const SizedBox(height: 12),
+                    const Text('Wishlist masih kosong',
+                        style: TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 4),
+                    const Text('Tap ikon hati di produk untuk menyimpannya',
+                        style: TextStyle(color: Colors.black54)),
+                    const SizedBox(height: 16),
+                    FilledButton(
+                      style: FilledButton.styleFrom(
+                          minimumSize: const Size(180, 46)),
+                      onPressed: () => navIndex.value = 0,
+                      child: const Text('Lihat produk'),
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            return CustomScrollView(
+              slivers: [
+                SliverPadding(
+                  padding: const EdgeInsets.all(16),
+                  sliver: ProductGridSliver(products: items),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// PROFILE PAGE
+// ------------------------------------------------------------
+class ProfilePage extends StatelessWidget {
+  const ProfilePage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([auth, wishlist, cart, orderStore]),
+      builder: (context, _) {
+        final u = auth.user;
+        if (u == null) return const SizedBox.shrink();
+        final scheme = Theme.of(context).colorScheme;
+        final orderCount = orderStore.ordersFor(u.email).length;
+
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            // Kartu identitas
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  children: [
+                    UserAvatar(name: u.name, radius: 44),
+                    const SizedBox(height: 14),
+                    Text(u.name,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            fontSize: 20, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 2),
+                    Text(u.email,
+                        style: const TextStyle(color: Colors.black54)),
+                    if (u.gender != null || u.age != null) ...[
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        children: [
+                          if (u.gender != null)
+                            Chip(
+                              label: Text(u.gender!),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                          if (u.age != null)
+                            Chip(
+                              label: Text('${u.age} yrs'),
+                              visualDensity: VisualDensity.compact,
+                            ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 12),
+
+            // Statistik
+            Row(
+              children: [
+                Expanded(
+                  child: _Stat(
+                    icon: Icons.receipt_long_outlined,
+                    value: '$orderCount',
+                    label: 'Orders',
+                    onTap: () => navIndex.value = 3,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _Stat(
+                    icon: Icons.favorite_border,
+                    value: '${wishlist.count}',
+                    label: 'Wishlist',
+                    onTap: () => navIndex.value = 2,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: _Stat(
+                    icon: Icons.shopping_cart_outlined,
+                    value: '${cart.count}',
+                    label: 'In cart',
+                    onTap: () => navIndex.value = 1,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // Detail
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Column(
+                  children: [
+                    _InfoRow(
+                        icon: Icons.phone_outlined,
+                        label: 'Phone',
+                        value: u.phone),
+                    _InfoRow(
+                        icon: Icons.location_on_outlined,
+                        label: 'Address',
+                        value: u.address.isEmpty ? null : u.address),
+                    _InfoRow(
+                        icon: Icons.wc_outlined,
+                        label: 'Gender',
+                        value: u.gender),
+                    _InfoRow(
+                        icon: Icons.cake_outlined,
+                        label: 'Age',
+                        value: u.age == null ? null : '${u.age}'),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 20),
+
+            FilledButton.icon(
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const EditProfilePage()),
+              ),
+              icon: const Icon(Icons.edit_outlined),
+              label: const Text('Edit Profile',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.redAccent,
+                side: const BorderSide(color: Colors.redAccent),
+              ),
+              onPressed: () => confirmLogout(context),
+              icon: const Icon(Icons.logout),
+              label: const Text('Logout',
+                  style: TextStyle(fontWeight: FontWeight.w700)),
+            ),
+            const SizedBox(height: 8),
+            Center(
+              child: Text('Akun tersimpan lokal di perangkat ini',
+                  style: TextStyle(
+                      fontSize: 11, color: scheme.onSurface.withValues(alpha: 0.4))),
+            ),
+          ],
+        );
+      },
+    );
+  }
+}
+
+class _Stat extends StatelessWidget {
+  final IconData icon;
+  final String value;
+  final String label;
+  final VoidCallback onTap;
+  const _Stat({
+    required this.icon,
+    required this.value,
+    required this.label,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 14),
+          child: Column(
+            children: [
+              Icon(icon, color: Theme.of(context).colorScheme.primary),
+              const SizedBox(height: 6),
+              Text(value,
+                  style: const TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.w800)),
+              Text(label,
+                  style: const TextStyle(fontSize: 12, color: Colors.black54)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _InfoRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final String? value;
+  const _InfoRow({required this.icon, required this.label, this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    final empty = value == null || value!.isEmpty;
+    return ListTile(
+      leading: Icon(icon, color: Theme.of(context).colorScheme.primary),
+      title: Text(label,
+          style: const TextStyle(fontSize: 12, color: Colors.black54)),
+      subtitle: Text(
+        empty ? 'Belum diisi' : value!,
+        style: TextStyle(
+          fontSize: 15,
+          fontWeight: FontWeight.w600,
+          color: empty ? Colors.black38 : Colors.black87,
+          fontStyle: empty ? FontStyle.italic : FontStyle.normal,
+        ),
+      ),
+    );
+  }
+}
+
+class EditProfilePage extends StatefulWidget {
+  const EditProfilePage({super.key});
+
+  @override
+  State<EditProfilePage> createState() => _EditProfilePageState();
+}
+
+class _EditProfilePageState extends State<EditProfilePage> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _name;
+  late final TextEditingController _phone;
+  late final TextEditingController _address;
+  late final TextEditingController _age;
+  String? _gender;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    final u = auth.user!;
+    _name = TextEditingController(text: u.name);
+    _phone = TextEditingController(text: u.phone);
+    _address = TextEditingController(text: u.address);
+    _age = TextEditingController(text: u.age?.toString() ?? '');
+    _gender = u.gender;
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_name, _phone, _address, _age]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    FocusScope.of(context).unfocus();
+    if (!_formKey.currentState!.validate()) return;
+    setState(() => _saving = true);
+    final messenger = ScaffoldMessenger.of(context);
+    final nav = Navigator.of(context);
+
+    await auth.updateProfile(
+      auth.user!.withProfile(
+        name: _name.text.trim(),
+        phone: _phone.text.trim(),
+        address: _address.text.trim(),
+        gender: _gender,
+        age: int.tryParse(_age.text),
+      ),
+    );
+
+    nav.pop();
+    messenger.showSnackBar(
+      SnackBar(
+        behavior: SnackBarBehavior.floating,
+        backgroundColor: Colors.green.shade800,
+        content: const Text('Profil berhasil diperbarui'),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final u = auth.user!;
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Edit Profile',
+            style: TextStyle(fontWeight: FontWeight.w700)),
+      ),
+      body: Form(
+        key: _formKey,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Center(
+              child: ListenableBuilder(
+                listenable: _name,
+                builder: (context, _) =>
+                    UserAvatar(name: _name.text, radius: 44),
+              ),
+            ),
+            const SizedBox(height: 20),
+            TextFormField(
+              controller: _name,
+              textCapitalization: TextCapitalization.words,
+              decoration: const InputDecoration(
+                  labelText: 'Full name *',
+                  prefixIcon: Icon(Icons.person_outline)),
+              validator: (v) => (v == null || v.trim().length < 3)
+                  ? 'Isi nama lengkap (min. 3 karakter)'
+                  : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              initialValue: u.email,
+              enabled: false,
+              decoration: const InputDecoration(
+                  labelText: 'Email (tidak bisa diubah)',
+                  prefixIcon: Icon(Icons.mail_outline)),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _phone,
+              keyboardType: TextInputType.phone,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(15),
+              ],
+              decoration: const InputDecoration(
+                  labelText: 'Phone number *',
+                  prefixIcon: Icon(Icons.phone_outlined)),
+              validator: (v) => (v == null || v.length < 8)
+                  ? 'Nomor telepon tidak valid'
+                  : null,
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _address,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                  labelText: 'Address (optional)',
+                  alignLabelWithHint: true,
+                  prefixIcon: Icon(Icons.location_on_outlined)),
+            ),
+            const SizedBox(height: 12),
+            TextFormField(
+              controller: _age,
+              keyboardType: TextInputType.number,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(3),
+              ],
+              decoration: const InputDecoration(
+                  labelText: 'Age (optional)',
+                  prefixIcon: Icon(Icons.cake_outlined)),
+              validator: (v) {
+                if (v == null || v.isEmpty) return null;
+                final n = int.tryParse(v);
+                return (n == null || n < 1 || n > 120)
+                    ? 'Umur tidak valid'
+                    : null;
+              },
+            ),
+            const SizedBox(height: 16),
+            const Text('Gender (optional)',
+                style: TextStyle(color: Colors.black54)),
+            const SizedBox(height: 6),
+            GenderPicker(
+              value: _gender,
+              onChanged: (g) => setState(() => _gender = g),
+            ),
+            const SizedBox(height: 24),
+            FilledButton(
+              onPressed: _saving ? null : _save,
+              child: const Text('Save Changes',
+                  style:
+                      TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 // ------------------------------------------------------------
@@ -918,9 +2157,9 @@ class CheckoutPage extends StatefulWidget {
 
 class _CheckoutPageState extends State<CheckoutPage> {
   final _formKey = GlobalKey<FormState>();
-  final _name = TextEditingController();
-  final _phone = TextEditingController();
-  final _address = TextEditingController();
+  late final TextEditingController _name;
+  late final TextEditingController _phone;
+  late final TextEditingController _address;
   final _cardNo = TextEditingController();
   final _expiry = TextEditingController();
   final _cvv = TextEditingController();
@@ -930,6 +2169,16 @@ class _CheckoutPageState extends State<CheckoutPage> {
 
   double get _shipping => _express ? 8.0 : 3.0;
   double get _total => cart.subtotal + _shipping;
+
+  @override
+  void initState() {
+    super.initState();
+    // Isi otomatis dari profil user
+    final u = auth.user;
+    _name = TextEditingController(text: u?.name ?? '');
+    _phone = TextEditingController(text: u?.phone ?? '');
+    _address = TextEditingController(text: u?.address ?? '');
+  }
 
   @override
   void dispose() {
@@ -943,7 +2192,6 @@ class _CheckoutPageState extends State<CheckoutPage> {
     FocusScope.of(context).unfocus();
     if (!_formKey.currentState!.validate()) return;
 
-    // Dialog loading "memproses pembayaran"
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -973,6 +2221,7 @@ class _CheckoutPageState extends State<CheckoutPage> {
 
     final order = Order(
       id: 'ORD-${DateTime.now().millisecondsSinceEpoch % 1000000}',
+      userEmail: auth.user?.email ?? '',
       date: DateTime.now(),
       items: cart.items.map((i) => CartItem(i.product, i.qty)).toList(),
       total: _total,
@@ -1006,9 +2255,11 @@ class _CheckoutPageState extends State<CheckoutPage> {
               controller: _name,
               textCapitalization: TextCapitalization.words,
               decoration: const InputDecoration(
-                  labelText: 'Full name', prefixIcon: Icon(Icons.person_outline)),
-              validator: (v) =>
-                  (v == null || v.trim().length < 3) ? 'Isi nama lengkap' : null,
+                  labelText: 'Full name',
+                  prefixIcon: Icon(Icons.person_outline)),
+              validator: (v) => (v == null || v.trim().length < 3)
+                  ? 'Isi nama lengkap'
+                  : null,
             ),
             const SizedBox(height: 12),
             TextFormField(
@@ -1029,8 +2280,9 @@ class _CheckoutPageState extends State<CheckoutPage> {
                   labelText: 'Full address',
                   alignLabelWithHint: true,
                   prefixIcon: Icon(Icons.location_on_outlined)),
-              validator: (v) =>
-                  (v == null || v.trim().length < 8) ? 'Isi alamat lengkap' : null,
+              validator: (v) => (v == null || v.trim().length < 8)
+                  ? 'Isi alamat lengkap'
+                  : null,
             ),
             const SizedBox(height: 20),
             _section('Shipping Method'),
@@ -1134,8 +2386,9 @@ class _CheckoutPageState extends State<CheckoutPage> {
                   labelText: 'Card number',
                   hintText: '4242424242424242',
                   prefixIcon: Icon(Icons.credit_card)),
-              validator: (v) =>
-                  (v == null || v.length != 16) ? 'Nomor kartu 16 digit' : null,
+              validator: (v) => (v == null || v.length != 16)
+                  ? 'Nomor kartu 16 digit'
+                  : null,
             ),
             const SizedBox(height: 12),
             Row(
@@ -1276,7 +2529,9 @@ class _OptionTile extends StatelessWidget {
         duration: const Duration(milliseconds: 150),
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
         decoration: BoxDecoration(
-          color: selected ? scheme.primaryContainer.withValues(alpha: 0.6) : Colors.white,
+          color: selected
+              ? scheme.primaryContainer.withValues(alpha: 0.6)
+              : Colors.white,
           borderRadius: BorderRadius.circular(14),
           border: Border.all(
             color: selected ? scheme.primary : Colors.green.shade100,
@@ -1381,7 +2636,7 @@ class SuccessPage extends StatelessWidget {
                     const SizedBox(height: 8),
                     TextButton(
                       onPressed: () {
-                        navIndex.value = 2;
+                        navIndex.value = 3;
                         Navigator.popUntil(context, (r) => r.isFirst);
                       },
                       child: const Text('View Order History'),
@@ -1417,7 +2672,7 @@ class SuccessPage extends StatelessWidget {
 }
 
 // ------------------------------------------------------------
-// ORDER HISTORY PAGE
+// ORDER HISTORY PAGE (per user)
 // ------------------------------------------------------------
 class OrdersPage extends StatelessWidget {
   const OrdersPage({super.key});
@@ -1425,9 +2680,9 @@ class OrdersPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: orderStore,
+      listenable: Listenable.merge([orderStore, auth]),
       builder: (context, _) {
-        final orders = orderStore.orders;
+        final orders = orderStore.ordersFor(auth.user?.email);
         if (orders.isEmpty) {
           return Center(
             child: Column(
